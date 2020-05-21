@@ -43,6 +43,7 @@ const (
 )
 
 var ErrNilContextPass = errors.New("can't pass an nil context")
+var ErrFailAddBatch = errors.New("fail add to batch builder")
 
 type partitionProducer struct {
 	state  producerState
@@ -282,7 +283,7 @@ func (p *partitionProducer) internalSend(request *sendRequest) {
 		sequenceID = internal.GetAndAdd(p.sequenceIDGenerator, 1)
 	}
 
-	// check after flush before add to batch
+	// check before add to batch
 	if request.responseCallBackIfCtxDone() {
 		p.publishSemaphore.Release()
 		return
@@ -308,6 +309,10 @@ func (p *partitionProducer) internalSend(request *sendRequest) {
 					WithField("sequenceID", sequenceID).
 					WithField("properties", msg.Properties).
 					Error("unable to add message to batch")
+
+				request.CallBack(nil, request.msg, ErrFailAddBatch)   //Send and SendAsync need callback
+				p.publishSemaphore.Release()
+				return
 			} else {
 				request.addToBuilderAt = time.Now()
 			}
@@ -322,6 +327,10 @@ func (p *partitionProducer) internalSend(request *sendRequest) {
 				WithField("sequenceID", sequenceID).
 				WithField("properties", msg.Properties).
 				Error("unable to send single message")
+
+			request.CallBack(nil, request.msg, ErrFailAddBatch)   //Send and SendAsync need callback
+			p.publishSemaphore.Release()
+			return
 		} else {
 			request.addToBuilderAt = time.Now()
 		}
@@ -378,6 +387,8 @@ func (pi *pendingItem) checkRequestsContextDone() (allRequestDone bool) {
 		if sr.responseCallBackIfCtxDone() {
 			pi.requestCtxDone.Set(uint(idx))
 			log.Debugf("request %v in pendingItem context done.", idx)
+		}else{
+			break
 		}
 	}
 	var endTime = time.Now()
@@ -459,7 +470,8 @@ func (p *partitionProducer) Send(ctx context.Context, msg *ProducerMessage) (Mes
 	if ctx == nil {
 		return nil, ErrNilContextPass
 	}
-	wg := make(chan struct{}, 1)
+	wc := make(chan struct{}, 1)
+	defer close(wc)
 
 	var err error
 	var msgID MessageID
@@ -467,18 +479,15 @@ func (p *partitionProducer) Send(ctx context.Context, msg *ProducerMessage) (Mes
 	p.internalSendAsync(ctx, msg, func(ID MessageID, message *ProducerMessage, e error) {
 		err = e
 		msgID = ID
-		wg <- struct{}{}
+		wc <- struct{}{}
 	}, true)
 
 	for {
 		select {
-		case <-wg:
-			close(wg)
+		case <-wc:
 			return msgID, err
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
-			time.Sleep(p.options.SendTimeoutCheckInterval)
 		}
 	}
 }
@@ -487,6 +496,7 @@ func (p *partitionProducer) SendAsync(ctx context.Context, msg *ProducerMessage,
 	callback func(MessageID, *ProducerMessage, error)) {
 	if ctx == nil {
 		callback(nil, msg, ErrNilContextPass)
+		return
 	}
 
 	sr := newsendRequest(ctx, msg, callback, false)
@@ -501,8 +511,6 @@ func (p *partitionProducer) SendAsync(ctx context.Context, msg *ProducerMessage,
 			log.Debugf("send timeout because for publishSemaphore %v", msg)
 			callback(nil, msg, ctx.Err())
 			return
-		default:
-			time.Sleep(p.options.SendTimeoutCheckInterval / 4)
 		}
 	}
 }
@@ -520,10 +528,7 @@ func (p *partitionProducer) internalSendAsync(ctx context.Context, msg *Producer
 			return
 		case <-ctx.Done():
 			log.Debugf("send timeout because for publishSemaphore %v", msg)
-			callback(nil, msg, ctx.Err())
 			return
-		default:
-			time.Sleep(p.options.SendTimeoutCheckInterval / 4)
 		}
 	}
 }
@@ -717,8 +722,8 @@ func (request *sendRequest) responseCallBackIfCtxDone() (callbackCalledByThisCal
 	request.Lock()
 	defer request.Unlock()
 
-	if request.callbackCalled {
-		return false
+	if request.callbackCalled {          //ctx done
+		return true
 	}
 
 	request.lastTimeCheckCtxDoneAt = time.Now()
