@@ -31,19 +31,19 @@ import (
 	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
 )
 
-type producerState int
-
 const (
-	producerInit producerState = iota
+	// producer states
+	producerInit int32 = iota
 	producerReady
 	producerClosing
 	producerClosed
 )
 
-var ErrNilContextPass = errors.New("can't pass an nil context")
+var errFailAddBatch = errors.New("message send failed")
+var errNilContextPass = errors.New("can't pass an nil context")
 
 type partitionProducer struct {
-	state  producerState
+	state  int32
 	client *client
 	topic  string
 	log    *log.Entry
@@ -122,7 +122,7 @@ func newPartitionProducer(client *client, topic string, options *ProducerOptions
 
 	p.log = p.log.WithField("producer_name", p.producerName)
 	p.log.WithField("cnx", p.cnx.ID()).Info("Created producer")
-	p.state = producerReady
+	atomic.StoreInt32(&p.state, producerReady)
 
 	go p.runEventsLoop()
 	go p.checkTimeoutEventsLoop()
@@ -199,7 +199,7 @@ func (p *partitionProducer) ConnectionClosed() {
 func (p *partitionProducer) reconnectToBroker() {
 	backoff := internal.Backoff{}
 	for {
-		if p.state != producerReady {
+		if atomic.LoadInt32(&p.state) != producerReady {
 			// Producer is already closing
 			return
 		}
@@ -295,48 +295,31 @@ func (p *partitionProducer) internalSend(request *sendRequest) {
 	}
 
 	// check after flush before add to batch
-	if _, done := request.responseCallBackIfCtxDone(); done {
+	if done := request.responseCallBackIfCtxDone(); done {
 		p.publishSemaphore.Release()
 		return
 	}
 
-	if sendAsBatch {
-		added := p.batchBuilder.Add(smm, sequenceID, msg.Payload, request,
-			msg.ReplicationClusters, deliverAt)
-		if !added {
-			// The current batch is full.. flush it and retry
-			p.internalFlushCurrentBatch()
+	added := p.batchBuilder.Add(smm, sequenceID, msg.Payload, request,
+		msg.ReplicationClusters, deliverAt)
+	if !added {
+		// The current batch is full.. flush it and retry
+		p.internalFlushCurrentBatch()
 
-			// check after flush before add to batch
-			if _, done := request.responseCallBackIfCtxDone(); done {
-				p.publishSemaphore.Release()
-				return
-			}
-
-			// after flushing try again to add the current payload
-			if ok := p.batchBuilder.Add(smm, sequenceID, msg.Payload, request,
-				msg.ReplicationClusters, deliverAt); !ok {
-				p.log.WithField("size", len(msg.Payload)).
-					WithField("sequenceID", sequenceID).
-					WithField("properties", msg.Properties).
-					Error("unable to add message to batch")
-			}
-		}
-
-	} else {
-		// Send individually
-		if added := p.batchBuilder.Add(smm, sequenceID, msg.Payload, request,
-			msg.ReplicationClusters, deliverAt); !added {
+		// after flushing try again to add the current payload
+		if ok := p.batchBuilder.Add(smm, sequenceID, msg.Payload, request,
+			msg.ReplicationClusters, deliverAt); !ok {
+			p.publishSemaphore.Release()
+			request.setCalledWithErr(errFailAddBatch)
 			p.log.WithField("size", len(msg.Payload)).
 				WithField("sequenceID", sequenceID).
 				WithField("properties", msg.Properties).
-				Error("unable to send single message")
+				Error("unable to add message to batch")
+			return
 		}
-
-		p.internalFlushCurrentBatch()
 	}
 
-	if request.flushImmediately {
+	if !sendAsBatch || request.flushImmediately {
 		p.internalFlushCurrentBatch()
 	}
 }
@@ -347,7 +330,7 @@ func (p *partitionProducer) internalCheckSendTimeout() {
 	for checkNext {
 		_, empty, satisfy := p.checkTimeoutQueue.PollIfSatisfy(func(item interface{}) bool {
 			sr := item.(*sendRequest)
-			_, done := sr.responseCallBackIfCtxDone()
+			done := sr.responseCallBackIfCtxDone()
 			return done
 		})
 		checkNext = !empty && satisfy
@@ -367,7 +350,7 @@ func (pi *pendingItem) checkRequestsContextDone() (allRequestDone bool) {
 	allRequestDone = true
 	for _, i := range pi.sendRequests {
 		sr := i.(*sendRequest)
-		if _, callBacked := sr.responseCallBackIfCtxDone(); !callBacked {
+		if callBacked := sr.responseCallBackIfCtxDone(); !callBacked {
 			allRequestDone = false
 		}
 	}
@@ -431,7 +414,7 @@ func (p *partitionProducer) internalFlush(fr *flushRequest) {
 		return
 	}
 
-	sendReq := newsendRequest(context.Background(),
+	sendReq := newSendRequest(context.Background(),
 		nil,
 		func(id MessageID, message *ProducerMessage, e error) {
 			fr.err = e
@@ -444,7 +427,7 @@ func (p *partitionProducer) internalFlush(fr *flushRequest) {
 
 func (p *partitionProducer) Send(ctx context.Context, msg *ProducerMessage) (MessageID, error) {
 	if ctx == nil {
-		return nil, ErrNilContextPass
+		return nil, errNilContextPass
 	}
 	chanWaitGroup := make(chan struct{}, 1)
 
@@ -471,34 +454,21 @@ func (p *partitionProducer) Send(ctx context.Context, msg *ProducerMessage) (Mes
 func (p *partitionProducer) SendAsync(ctx context.Context, msg *ProducerMessage,
 	callback func(MessageID, *ProducerMessage, error)) {
 	if ctx == nil {
-		callback(nil, msg, ErrNilContextPass)
+		callback(nil, msg, errNilContextPass)
+		return
 	}
 
-	sr := newsendRequest(ctx, msg, callback, false)
+	sr := newSendRequest(ctx, msg, callback, false)
 
 	if sr.needCheckTimeoutOrCancel() {
 		p.checkTimeoutQueue.Put(sr)
-	}
-
-	// may be message will block on eventChan publish event
-	checkContextIfBlockOnEventChan := func() (ctxDone bool) {
-		for {
-			select {
-			case p.eventsChan <- sr:
-				return false
-			case <-ctx.Done():
-				log.Debugf("send timeout because for eventChan Block %v", msg)
-				sr.CallBack(nil, msg, ctx.Err())
-				return true
-			}
-		}
 	}
 
 	// may be message will block on acquire semaphore
 	for {
 		select {
 		case p.publishSemaphore <- true:
-			checkContextIfBlockOnEventChan()
+			p.eventsChan <- sr
 			return
 		case <-ctx.Done():
 			log.Debugf("send timeout because for publishSemaphore %v", msg)
@@ -510,31 +480,17 @@ func (p *partitionProducer) SendAsync(ctx context.Context, msg *ProducerMessage,
 
 func (p *partitionProducer) internalSendAsync(ctx context.Context, msg *ProducerMessage,
 	callback func(MessageID, *ProducerMessage, error), flushImmediately bool) {
-	sr := newsendRequest(ctx, msg, callback, flushImmediately)
+	sr := newSendRequest(ctx, msg, callback, flushImmediately)
 
 	if sr.needCheckTimeoutOrCancel() {
 		p.checkTimeoutQueue.Put(sr)
-	}
-
-	// may be message will block on eventChan publish event
-	checkContextIfBlockOnEventChan := func() (ctxDone bool) {
-		for {
-			select {
-			case p.eventsChan <- sr:
-				return false
-			case <-ctx.Done():
-				log.Debugf("send timeout because for eventChan Block %v", msg)
-				sr.CallBack(nil, msg, ctx.Err())
-				return true
-			}
-		}
 	}
 
 	// may be message will block on acquire semaphore
 	for {
 		select {
 		case p.publishSemaphore <- true:
-			checkContextIfBlockOnEventChan()
+			p.eventsChan <- sr
 			return
 		case <-ctx.Done():
 			log.Debugf("send timeout because for publishSemaphore %v", msg)
@@ -594,11 +550,10 @@ func (p *partitionProducer) ReceivedSendReceipt(response *pb.CommandSendReceipt)
 
 func (p *partitionProducer) internalClose(req *closeProducer) {
 	defer req.waitGroup.Done()
-	if p.state != producerReady {
+	if !atomic.CompareAndSwapInt32(&p.state, producerReady, producerClosing) {
 		return
 	}
 
-	p.state = producerClosing
 	p.log.Info("Closing producer")
 
 	id := p.client.rpcClient.NewRequestID()
@@ -613,7 +568,7 @@ func (p *partitionProducer) internalClose(req *closeProducer) {
 		p.log.Info("Closed producer")
 	}
 
-	p.state = producerClosed
+	atomic.StoreInt32(&p.state, producerClosed)
 	p.cnx.UnregisterListener(p.producerID)
 	p.batchFlushTicker.Stop()
 	p.checkSendTimeoutTicker.Stop()
@@ -636,7 +591,7 @@ func (p *partitionProducer) Flush() error {
 }
 
 func (p *partitionProducer) Close() {
-	if p.state != producerReady {
+	if atomic.LoadInt32(&p.state) != producerReady {
 		// Producer is closing
 		return
 	}
@@ -653,27 +608,23 @@ func (p *partitionProducer) Close() {
 type sendRequest struct {
 	ctx              context.Context
 	msg              *ProducerMessage
-	callback         *onceCallback
+	callback         func(MessageID, *ProducerMessage, error)
 	flushImmediately bool
 
 	sync.Mutex
+	once     sync.Once
 	callbackCalled bool
 }
 
-type onceCallback struct {
-	once     sync.Once
-	callback func(MessageID, *ProducerMessage, error)
-}
-
 func (request *sendRequest) CallBack(messageID MessageID, msg *ProducerMessage, err error) {
-	request.callback.once.Do(func() {
-		request.callback.callback(messageID, msg, err)
+	request.once.Do(func() {
+		request.callback(messageID, msg, err)
 	})
 }
 
 var defaultCallback = func(MessageID, *ProducerMessage, error) {}
 
-func newsendRequest(ctx context.Context,
+func newSendRequest(ctx context.Context,
 	msg *ProducerMessage,
 	callback func(MessageID, *ProducerMessage, error),
 	flushImmediately bool,
@@ -689,29 +640,36 @@ func newsendRequest(ctx context.Context,
 	return &sendRequest{
 		ctx: ctx,
 		msg: msg,
-		callback: &onceCallback{
-			callback: cb,
-		},
+		callback: cb,
 		flushImmediately: flushImmediately,
+		callbackCalled: false,
 	}
 }
 
-func (request *sendRequest) responseCallBackIfCtxDone() (callbackCalledByThisCall bool, callBackCalled bool) {
+func (request *sendRequest) responseCallBackIfCtxDone() (callBackCalled bool) {
 	request.Lock()
 	defer request.Unlock()
 
 	if request.callbackCalled {
-		return false, request.callbackCalled
+		return true
 	}
 
 	select {
 	case <-request.ctx.Done():
 		request.CallBack(nil, request.msg, request.ctx.Err())
 		request.callbackCalled = true
-		return true, request.callbackCalled
+		return true
 	default:
-		return false, request.callbackCalled
+		return false
 	}
+}
+
+func (request *sendRequest) setCalledWithErr(err error) {
+	request.Lock()
+	defer request.Unlock()
+
+	request.CallBack(nil, request.msg, err)
+	request.callbackCalled = true
 }
 
 func (request *sendRequest) needCheckTimeoutOrCancel() bool {
